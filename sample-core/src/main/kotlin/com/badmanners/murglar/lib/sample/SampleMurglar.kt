@@ -1,8 +1,5 @@
 package com.badmanners.murglar.lib.sample
 
-import android.content.Context
-import android.net.Uri
-import android.provider.DocumentsContract
 import com.badmanners.murglar.lib.core.localization.DefaultMessages.Companion.DEFAULT
 import com.badmanners.murglar.lib.core.localization.RussianMessages.Companion.RUSSIAN
 import com.badmanners.murglar.lib.core.log.LoggerMiddleware
@@ -48,7 +45,7 @@ class SampleMurglar(
 
         /**
          * SAF tree granted to Murglar ("save path" setting).
-         * If your tree differs (e.g. primary%3ADownload), change both constants below.
+         * If your tree differs, change both constants below.
          */
         const val TREE_URI = "content://com.android.externalstorage.documents/tree/primary%3AMusic"
         private const val TREE_PREFIX = "primary:Music"
@@ -99,9 +96,41 @@ class SampleMurglar(
         mediaIds.map { MediaId.getIds(it).first() }.mapNotNull { getTrackById(it) }
 
 
-    //region SAF helpers
+    //region SAF via reflection (sample-core has no Android SDK on classpath)
 
     class SafEntry(val relPath: String, val name: String, val isDir: Boolean, val bytes: Long)
+
+    private val context: Any? by lazy {
+        try {
+            Class.forName("android.app.ActivityThread")
+                .getMethod("currentApplication").invoke(null)
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    private val uriClass: Class<*> by lazy { Class.forName("android.net.Uri") }
+    private val documentsContractClass: Class<*> by lazy { Class.forName("android.provider.DocumentsContract") }
+
+    private fun contentResolver(): Any? = try {
+        context?.javaClass?.getMethod("getContentResolver")?.invoke(context)
+    } catch (e: Throwable) {
+        null
+    }
+
+    private fun parseUri(s: String): Any? =
+        uriClass.getMethod("parse", String::class.java).invoke(null, s)
+
+    fun relToDocId(rel: String) = if (rel.isEmpty()) TREE_PREFIX else "$TREE_PREFIX/$rel"
+
+    fun contentUriFor(rel: String): String? = try {
+        documentsContractClass
+            .getMethod("buildDocumentUriUsingTree", uriClass, String::class.java)
+            .invoke(null, parseUri(TREE_URI), relToDocId(rel))
+            .toString()
+    } catch (e: Throwable) {
+        null
+    }
 
     fun encodePath(path: String): String =
         path.toByteArray(Charsets.UTF_8).joinToString("") { "%02x".format(it) }
@@ -115,51 +144,58 @@ class SampleMurglar(
     fun isAudioFile(name: String) =
         AUDIO_EXTENSIONS.contains(name.substringAfterLast('.', "").lowercase())
 
-    private fun resolver(): android.content.ContentResolver? = try {
-        (Class.forName("android.app.ActivityThread")
-            .getMethod("currentApplication").invoke(null) as Context).contentResolver
-    } catch (e: Exception) {
-        null
-    }
-
-    fun relToDocId(rel: String) = if (rel.isEmpty()) TREE_PREFIX else "$TREE_PREFIX/$rel"
-
-    fun contentUriFor(rel: String): Uri =
-        DocumentsContract.buildDocumentUriUsingTree(Uri.parse(TREE_URI), relToDocId(rel))
-
     fun listSaf(rel: String): Pair<List<SafEntry>, List<SafEntry>>? {
-        val r = resolver() ?: return null
+        val resolver = contentResolver() ?: return null
+        var cursor: Any? = null
         return try {
-            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
-                Uri.parse(TREE_URI), relToDocId(rel)
-            )
+            val tree = parseUri(TREE_URI)
+            val childrenUri = documentsContractClass
+                .getMethod("buildChildDocumentsUriUsingTree", uriClass, String::class.java)
+                .invoke(null, tree, relToDocId(rel))
+
+            val projection = arrayOf("document_id", "_display_name", "mime_type", "_size")
+
+            cursor = resolver.javaClass.getMethod(
+                "query",
+                uriClass, Array<String>::class.java,
+                String::class.java, Array<String>::class.java, String::class.java
+            ).invoke(resolver, childrenUri, projection, null, null, null)
+                ?: return null
+
+            val cursorClass = cursor.javaClass
+            val moveToNext = cursorClass.getMethod("moveToNext")
+            val getString = cursorClass.getMethod("getString", Int::class.javaPrimitiveType)
+            val getLong = cursorClass.getMethod("getLong", Int::class.javaPrimitiveType)
+            val isNull = cursorClass.getMethod("isNull", Int::class.javaPrimitiveType)
+            val close = cursorClass.getMethod("close")
+
             val dirs = mutableListOf<SafEntry>()
             val files = mutableListOf<SafEntry>()
-            r.query(
-                childrenUri,
-                arrayOf(
-                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
-                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
-                    DocumentsContract.Document.COLUMN_MIME_TYPE,
-                    DocumentsContract.Document.COLUMN_SIZE
-                ),
-                null, null, null
-            )?.use { c ->
-                while (c.moveToNext()) {
-                    val docId = c.getString(0) ?: continue
-                    val name = c.getString(1) ?: continue
-                    if (name.startsWith(".")) continue
-                    val isDir = c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR
-                    val bytes = if (c.isNull(3)) 0L else c.getLong(3)
-                    val entry = SafEntry(docId.removePrefix("$TREE_PREFIX/"), name, isDir, bytes)
-                    if (isDir) dirs += entry
-                    else if (isAudioFile(name)) files += entry
-                }
-            } ?: return null
+
+            while (moveNext.invoke(cursor) as Boolean) {
+                val documentId = getString.invoke(cursor, 0) as? String ?: continue
+                val name = getString.invoke(cursor, 1) as? String ?: continue
+                if (name.startsWith(".")) continue
+                val mime = getString.invoke(cursor, 2) as? String
+                val isDir = mime == "vnd.android.document/directory"
+                val bytes = if (isNull.invoke(cursor, 3) as Boolean) 0L else getLong.invoke(cursor, 3) as Long
+
+                // documentId внутри дерева имеет вид "primary:Music/<путь>"
+                val relPath = documentId.removePrefix("$TREE_PREFIX/")
+
+                if (isDir)
+                    dirs += SafEntry(relPath, name, true, bytes)
+                else if (isAudioFile(name))
+                    files += SafEntry(relPath, name, false, bytes)
+            }
+
+            close.invoke(cursor)
+
             dirs.sortBy { it.name.lowercase() }
             files.sortBy { it.name.lowercase() }
             dirs to files
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            try { cursor?.javaClass?.getMethod("close")?.invoke(cursor) } catch (ignored: Throwable) {}
             null
         }
     }
@@ -175,7 +211,7 @@ class SampleMurglar(
             artistNames = listOf(artist),
             sources = listOf(
                 Source(
-                    contentUriFor(rel).toString(), null, "Local file",
+                    contentUriFor(rel) ?: rel, null, "Local file",
                     Extension.UNKNOWN, Container.PROGRESSIVE, Bitrate.B_UNKNOWN, HIGH_QUALITY
                 )
             ),
@@ -192,7 +228,9 @@ class SampleMurglar(
     private fun buildDiagnosticsReport(): String {
         val sb = StringBuilder()
 
-        sb.append("resolver: ${if (resolver() != null) "ok" else "NULL"}")
+        sb.append("context: ${if (context != null) "ok" else "NULL"}")
+        sb.append(" | resolver: ${if (contentResolver() != null) "ok" else "NULL"}")
+
         val root = listSaf("")
         if (root == null)
             sb.append(" | ROOT LIST FAILED (tree unavailable?)")
@@ -214,7 +252,8 @@ class SampleMurglar(
                 .getMethod("currentPackageName").invoke(null) as String
             val dir = File("/storage/emulated/0/Android/data/$pkg/files")
             dir.mkdirs()
-            val file = File(dir, "diagnostics.txt").writeText(...)
+            val file = File(dir, "diagnostics.txt")
+            file.writeText(sb.toString())
             file.absolutePath
         } catch (e: Exception) {
             "report write failed: ${e.message}"
