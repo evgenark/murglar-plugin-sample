@@ -91,7 +91,16 @@ class SampleMurglar(
     override suspend fun onCreate() {
     }
 
-    override suspend fun resolveSourceForUrl(track: SampleTrack, source: Source): Source = source
+    override suspend fun resolveSourceForUrl(track: SampleTrack, source: Source): Source {
+    logger.d(TAG, "resolveSourceForUrl: ${source.url}")
+    return source
+}
+
+companion object {
+    // ... существующие константы ...
+    private const val TAG = "LocalFilesPlugin"
+}
+
 
     override fun hasLyrics(track: SampleTrack) = false
 
@@ -336,21 +345,33 @@ class SampleMurglar(
                     sb.append(" | saf read: error ${e.message}")
                 }
 
-                // тест 2: обращаемся к собственному серверу как обычный HTTP-клиент
+                // тест 2: обращаемся к собственному серверу из фонового потока
                 try {
-                    val conn = URL(streamUrlFor(file.relPath)).openConnection() as HttpURLConnection
-                    conn.connectTimeout = 5000
-                    conn.readTimeout = 5000
-                    conn.requestMethod = "GET"
-                    val code = conn.responseCode
-                    val ins = if (code in 200..299) conn.inputStream else conn.errorStream
-                    val read = ins?.read() ?: -1
-                    ins?.close()
-                    conn.disconnect()
-                    sb.append(" | http self-test: $code (first byte: $read)")
+                    var result = "no result"
+                    val t = Thread {
+                        try {
+                            val conn = URL(streamUrlFor(file.relPath)).openConnection() as HttpURLConnection
+                            conn.connectTimeout = 5000
+                            conn.readTimeout = 5000
+                            conn.requestMethod = "GET"
+                            val code = conn.responseCode
+                            val ins = if (code in 200..299) conn.inputStream else conn.errorStream
+                            val first = ins?.read() ?: -1
+                            ins?.close()
+                            conn.disconnect()
+                            result = "$code (first byte: $first)"
+                        } catch (e: Exception) {
+                            result = "error ${e.javaClass.simpleName}: ${e.message}"
+                        }
+                    }
+                    t.isDaemon = true
+                    t.start()
+                    t.join(6000)
+                    sb.append(" | http self-test: ").append(result)
                 } catch (e: Exception) {
-                    sb.append(" | http self-test: error ${e.message}")
+                    sb.append(" | http self-test: outer error ${e.message}")
                 }
+              }
             }
         }
 
