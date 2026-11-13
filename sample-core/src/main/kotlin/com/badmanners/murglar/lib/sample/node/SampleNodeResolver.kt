@@ -61,7 +61,7 @@ class SampleNodeResolver(
 
 
     private suspend fun listRoot(parentPath: Path, page: Int?, params: Map<String, String>) =
-        listChildren("", parentPath)
+        listChildren("", parentPath) + murglar.buildRemoteTestTrack().convertSampleTrack(parentPath)
 
     private suspend fun listDir(parentPath: Path, page: Int?, params: Map<String, String>): List<Node> {
         val rel = murglar.decodeId(params["dirId"]!!) ?: return emptyList()
