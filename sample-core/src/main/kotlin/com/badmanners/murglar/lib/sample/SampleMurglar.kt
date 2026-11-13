@@ -1,5 +1,8 @@
 package com.badmanners.murglar.lib.sample
 
+import android.content.Context
+import android.net.Uri
+import android.provider.DocumentsContract
 import com.badmanners.murglar.lib.core.localization.DefaultMessages.Companion.DEFAULT
 import com.badmanners.murglar.lib.core.localization.RussianMessages.Companion.RUSSIAN
 import com.badmanners.murglar.lib.core.log.LoggerMiddleware
@@ -15,6 +18,7 @@ import com.badmanners.murglar.lib.core.model.track.source.SourceFormat
 import com.badmanners.murglar.lib.core.model.track.source.SourceFormat.SourceFormatAvailability.AVAILABLE
 import com.badmanners.murglar.lib.core.network.NetworkMiddleware
 import com.badmanners.murglar.lib.core.notification.NotificationMiddleware
+import com.badmanners.murglar.lib.core.preference.ActionPreference
 import com.badmanners.murglar.lib.core.preference.Preference
 import com.badmanners.murglar.lib.core.preference.PreferenceMiddleware
 import com.badmanners.murglar.lib.core.service.BaseMurglar
@@ -40,12 +44,14 @@ class SampleMurglar(
 ) {
 
     companion object {
-        /**
-         * Must be used only for [MediaId.build], don't pass it to the [BaseMurglar] constructor directly!
-         */
         const val SERVICE_ID = "localfiles"
 
-        const val MUSIC_DIR = "/storage/emulated/0/Music"
+        /**
+         * SAF tree granted to Murglar ("save path" setting).
+         * If your tree differs (e.g. primary%3ADownload), change both constants below.
+         */
+        const val TREE_URI = "content://com.android.externalstorage.documents/tree/primary%3AMusic"
+        private const val TREE_PREFIX = "primary:Music"
 
         val AUDIO_EXTENSIONS = setOf("mp3", "flac", "ogg", "oga", "m4a", "aac", "wav", "opus", "wma", "ape")
 
@@ -60,7 +66,15 @@ class SampleMurglar(
     override val nodeResolver = SampleNodeResolver(this, messages)
 
     override val murglarPreferences: List<Preference>
-        get() = emptyList()
+        get() = listOf(
+            ActionPreference(
+                id = "diagnostics",
+                title = "Diagnostics",
+                summary = "Tests SAF access to the Music folder",
+                action = { notifications.longNotify(buildDiagnosticsReport()) },
+                needConfirmation = false
+            )
+        )
 
     override val possibleFormats: List<SourceFormat>
         get() = listOf(
@@ -85,7 +99,9 @@ class SampleMurglar(
         mediaIds.map { MediaId.getIds(it).first() }.mapNotNull { getTrackById(it) }
 
 
-    //region local file helpers
+    //region SAF helpers
+
+    class SafEntry(val relPath: String, val name: String, val isDir: Boolean, val bytes: Long)
 
     fun encodePath(path: String): String =
         path.toByteArray(Charsets.UTF_8).joinToString("") { "%02x".format(it) }
@@ -96,39 +112,115 @@ class SampleMurglar(
         null
     }
 
-    fun isAudioFile(file: File) = AUDIO_EXTENSIONS.contains(file.extension.lowercase())
+    fun isAudioFile(name: String) =
+        AUDIO_EXTENSIONS.contains(name.substringAfterLast('.', "").lowercase())
 
-    fun buildTrack(file: File): SampleTrack {
-        val id = encodePath(file.absolutePath)
-        val artist = file.parentFile?.name ?: "Unknown"
-        val source = Source(
-            file.toURI().toString(), null, "Local file",
-            Extension.UNKNOWN, Container.PROGRESSIVE, Bitrate.B_UNKNOWN, HIGH_QUALITY
-        )
+    private fun resolver(): android.content.ContentResolver? = try {
+        (Class.forName("android.app.ActivityThread")
+            .getMethod("currentApplication").invoke(null) as Context).contentResolver
+    } catch (e: Exception) {
+        null
+    }
+
+    fun relToDocId(rel: String) = if (rel.isEmpty()) TREE_PREFIX else "$TREE_PREFIX/$rel"
+
+    fun contentUriFor(rel: String): Uri =
+        DocumentsContract.buildDocumentUriUsingTree(Uri.parse(TREE_URI), relToDocId(rel))
+
+    fun listSaf(rel: String): Pair<List<SafEntry>, List<SafEntry>>? {
+        val r = resolver() ?: return null
+        return try {
+            val childrenUri = DocumentsContract.buildChildDocumentsUriUsingTree(
+                Uri.parse(TREE_URI), relToDocId(rel)
+            )
+            val dirs = mutableListOf<SafEntry>()
+            val files = mutableListOf<SafEntry>()
+            r.query(
+                childrenUri,
+                arrayOf(
+                    DocumentsContract.Document.COLUMN_DOCUMENT_ID,
+                    DocumentsContract.Document.COLUMN_DISPLAY_NAME,
+                    DocumentsContract.Document.COLUMN_MIME_TYPE,
+                    DocumentsContract.Document.COLUMN_SIZE
+                ),
+                null, null, null
+            )?.use { c ->
+                while (c.moveToNext()) {
+                    val docId = c.getString(0) ?: continue
+                    val name = c.getString(1) ?: continue
+                    if (name.startsWith(".")) continue
+                    val isDir = c.getString(2) == DocumentsContract.Document.MIME_TYPE_DIR
+                    val bytes = if (c.isNull(3)) 0L else c.getLong(3)
+                    val entry = SafEntry(docId.removePrefix("$TREE_PREFIX/"), name, isDir, bytes)
+                    if (isDir) dirs += entry
+                    else if (isAudioFile(name)) files += entry
+                }
+            } ?: return null
+            dirs.sortBy { it.name.lowercase() }
+            files.sortBy { it.name.lowercase() }
+            dirs to files
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun buildTrack(rel: String): SampleTrack {
+        val name = rel.substringAfterLast('/')
+        val parent = rel.substringBeforeLast('/', "")
+        val artist = if (parent.isEmpty()) "Music" else parent.substringAfterLast('/')
         return SampleTrack(
-            id = id,
-            title = file.nameWithoutExtension,
-            filePath = file.absolutePath,
+            id = encodePath(rel),
+            title = name.substringBeforeLast('.'),
+            filePath = rel,
             artistNames = listOf(artist),
-            sources = listOf(source),
-            mediaId = MediaId.build(SERVICE_ID, id),
+            sources = listOf(
+                Source(
+                    contentUriFor(rel).toString(), null, "Local file",
+                    Extension.UNKNOWN, Container.PROGRESSIVE, Bitrate.B_UNKNOWN, HIGH_QUALITY
+                )
+            ),
+            mediaId = MediaId.build(SERVICE_ID, encodePath(rel)),
             nodeType = NodeType.TRACK
         )
     }
 
     fun getTrackById(id: String): SampleTrack? {
-        val path = decodeId(id) ?: return null
-        val file = File(path)
-        return if (file.isFile) buildTrack(file) else null
+        val rel = decodeId(id) ?: return null
+        return buildTrack(rel)
     }
 
-    fun listAudioChildren(dir: File): Pair<List<File>, List<File>>? {
-        if (!dir.isDirectory)
-            return null
-        val children = dir.listFiles()?.filter { !it.name.startsWith(".") } ?: return null
-        val dirs = children.filter { it.isDirectory }.sortedBy { it.name.lowercase() }
-        val tracks = children.filter { it.isFile && isAudioFile(it) }.sortedBy { it.name.lowercase() }
-        return dirs to tracks
+    private fun buildDiagnosticsReport(): String {
+        val sb = StringBuilder()
+
+        sb.append("resolver: ${if (resolver() != null) "ok" else "NULL"}")
+        val root = listSaf("")
+        if (root == null)
+            sb.append(" | ROOT LIST FAILED (tree unavailable?)")
+        else {
+            sb.append(" | Music: dirs=${root.first.size} files=${root.second.size}")
+            if (root.first.isNotEmpty()) {
+                val sub = listSaf(root.first[0].relPath)
+                if (sub == null)
+                    sb.append(" | ${root.first[0].name}: LIST FAILED")
+                else
+                    sb.append(" | ${root.first[0].name}: dirs=${sub.first.size} files=${sub.second.size}")
+            }
+            if (root.second.isNotEmpty())
+                sb.append(" | sample url: ${contentUriFor(root.second[0].relPath)}")
+        }
+
+        val reportPath = try {
+            val pkg = Class.forName("android.app.ActivityThread")
+                .getMethod("currentPackageName").invoke(null) as String
+            val dir = File("/storage/emulated/0/Android/data/$pkg/files")
+            dir.mkdirs()
+            File(dir, "diagnostics.txt").writeText(sb.toString())
+            file.absolutePath
+        } catch (e: Exception) {
+            "report write failed: ${e.message}"
+        }
+        sb.append(" | FULL REPORT: $reportPath")
+        return sb.toString()
     }
     //endregion
 }
