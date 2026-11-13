@@ -1,5 +1,7 @@
 package com.badmanners.murglar.lib.sample
 
+import java.net.HttpURLConnection
+import java.net.URL
 import com.badmanners.murglar.lib.core.localization.DefaultMessages.Companion.DEFAULT
 import com.badmanners.murglar.lib.core.localization.RussianMessages.Companion.RUSSIAN
 import com.badmanners.murglar.lib.core.log.LoggerMiddleware
@@ -289,44 +291,84 @@ class SampleMurglar(
 
     //endregion
 
-
     private fun buildDiagnosticsReport(): String {
-        val sb = StringBuilder()
+    val sb = StringBuilder()
 
-        sb.append("context: ${if (context != null) "ok" else "NULL"}")
-        sb.append(" | resolver: ${if (contentResolver() != null) "ok" else "NULL"}")
+    sb.append("context: ${if (context != null) "ok" else "NULL"}")
+    sb.append(" | resolver: ${if (contentResolver() != null) "ok" else "NULL"}")
 
-        val root = listSaf("")
-        if (root == null)
-            sb.append(" | ROOT LIST FAILED (tree unavailable?)")
-        else {
-            sb.append(" | Music: dirs=${root.first.size} files=${root.second.size}")
-            if (root.first.isNotEmpty()) {
-                val sub = listSaf(root.first[0].relPath)
-                if (sub == null)
-                    sb.append(" | ${root.first[0].name}: LIST FAILED")
-                else
-                    sb.append(" | ${root.first[0].name}: dirs=${sub.first.size} files=${sub.second.size}")
-            }
-            if (root.second.isNotEmpty()) {
-                val probe = root.second[0]
-                sb.append(" | server port: ${server.port}")
-                try {
-                    val stream = openSafStream(probe.relPath)
-                    if (stream == null)
-                        sb.append(" | stream: OPEN FAILED")
-                    else {
-                        val head = ByteArray(16)
-                        val read = stream.read(head)
-                        stream.close()
-                        sb.append(" | stream: ok ($read bytes) | ${probe.name}")
-                        sb.append(" | sample url: ${streamUrlFor(probe.relPath)}")
-                    }
-                } catch (e: Exception) {
-                    sb.append(" | stream: error ${e.message}")
+    val root = listSaf("")
+    if (root == null) {
+        sb.append(" | ROOT LIST FAILED (tree unavailable?)")
+    } else {
+        sb.append(" | Music: dirs=${root.first.size} files=${root.second.size}")
+
+        // первый попавшийся аудиофайл: из корня или из первой подпапки
+        var probe: SafEntry? = root.second.firstOrNull()
+        if (probe == null && root.first.isNotEmpty()) {
+            val sub = listSaf(root.first[0].relPath)
+            if (sub == null)
+                sb.append(" | ${root.first[0].name}: LIST FAILED")
+            else
+                sb.append(" | ${root.first[0].name}: dirs=${sub.first.size} files=${sub.second.size}")
+            probe = sub?.second?.firstOrNull()
+        }
+
+        val file = probe
+        if (file == null) {
+            sb.append(" | no audio file for probe")
+        } else {
+            sb.append(" | probe: ${file.name}")
+            sb.append(" | server port: ${server.port}")
+
+            // тест 1: читаем файл напрямую через SAF
+            try {
+                val stream = openSafStream(file.relPath)
+                if (stream == null)
+                    sb.append(" | saf read: OPEN FAILED")
+                else {
+                    val head = ByteArray(16)
+                    val read = stream.read(head)
+                    stream.close()
+                    sb.append(" | saf read: ok ($read bytes)")
                 }
+            } catch (e: Exception) {
+                sb.append(" | saf read: error ${e.message}")
+            }
+
+            // тест 2: обращаемся к собственному серверу как обычный HTTP-клиент
+            try {
+                val conn = URL(streamUrlFor(file.relPath)).openConnection() as HttpURLConnection
+                conn.connectTimeout = 5000
+                conn.readTimeout = 5000
+                conn.requestMethod = "GET"
+                val code = conn.responseCode
+                val ins = if (code in 200..299) conn.inputStream else conn.errorStream
+                val read = ins?.read() ?: -1
+                ins?.close()
+                conn.disconnect()
+                sb.append(" | http self-test: $code (first byte: $read)")
+            } catch (e: Exception) {
+                sb.append(" | http self-test: error ${e.message}")
             }
         }
+    }
+
+    val reportPath = try {
+        val pkg = Class.forName("android.app.ActivityThread")
+            .getMethod("currentPackageName").invoke(null) as String
+        val dir = File("/storage/emulated/0/Android/data/$pkg/files")
+        dir.mkdirs()
+        val f = File(dir, "diagnostics.txt")
+        f.writeText(sb.toString())
+        f.absolutePath
+    } catch (e: Exception) {
+        "report write failed: ${e.message}"
+    }
+    sb.append(" | FULL REPORT: $reportPath")
+    return sb.toString()
+}
+
 
         val reportPath = try {
             val pkg = Class.forName("android.app.ActivityThread")
