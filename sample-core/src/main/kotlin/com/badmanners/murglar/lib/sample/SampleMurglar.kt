@@ -172,7 +172,7 @@ class SampleMurglar(
             val dirs = mutableListOf<SafEntry>()
             val files = mutableListOf<SafEntry>()
 
-            while (moveNext.invoke(cursor) as Boolean) {
+            while (moveToNext.invoke(cursor) as Boolean) {
                 val documentId = getString.invoke(cursor, 0) as? String ?: continue
                 val name = getString.invoke(cursor, 1) as? String ?: continue
                 if (name.startsWith(".")) continue
