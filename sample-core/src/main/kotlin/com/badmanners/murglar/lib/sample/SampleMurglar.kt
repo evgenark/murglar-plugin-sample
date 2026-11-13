@@ -34,10 +34,13 @@ import java.io.InputStream
 import java.io.OutputStream
 import java.net.HttpURLConnection
 import java.net.InetAddress
+import java.net.Inet4Address
+import java.net.NetworkInterface
 import java.net.ServerSocket
 import java.net.Socket
 import java.net.URL
 import java.util.concurrent.Executors
+import java.util.concurrent.atomic.AtomicBoolean
 
 
 class SampleMurglar(
@@ -63,6 +66,8 @@ class SampleMurglar(
 
         val AUDIO_EXTENSIONS = setOf("mp3", "flac", "ogg", "oga", "m4a", "aac", "wav", "opus", "wma", "ape")
 
+        const val REMOTE_TEST_TRACK_ID = "remote-test"
+
         private val MESSAGES = mapOf(
             DEFAULT to SampleDefaultMessages,
             RUSSIAN to SampleRussianMessages
@@ -73,6 +78,8 @@ class SampleMurglar(
 
     override val nodeResolver = SampleNodeResolver(this, messages)
 
+    private val useLan = AtomicBoolean(false)
+
     override val murglarPreferences: List<Preference>
         get() = listOf(
             ActionPreference(
@@ -80,6 +87,18 @@ class SampleMurglar(
                 title = "Diagnostics",
                 summary = "Tests SAF access and the local HTTP server",
                 action = { notifications.longNotify(buildDiagnosticsReport()) },
+                needConfirmation = false
+            ),
+            ActionPreference(
+                id = "toggle-lan",
+                title = "Переключить адрес сервера",
+                summary = "127.0.0.1 ↔ LAN (Wi-Fi). После переключения заново откройте папку с треками",
+                action = {
+                    useLan.set(!useLan.get())
+                    notifications.longNotify(
+                        "Now: " + if (useLan.get()) (lanHost() ?: "LAN unavailable") else "127.0.0.1"
+                    )
+                },
                 needConfirmation = false
             )
         )
@@ -96,7 +115,7 @@ class SampleMurglar(
     }
 
     override suspend fun resolveSourceForUrl(track: SampleTrack, source: Source): Source {
-        logd("resolveSourceForUrl called")
+        logd("resolveSourceForUrl called: ${source.url}")
         return source
     }
 
@@ -282,8 +301,27 @@ class SampleMurglar(
         ).also { it.start() }
     }
 
-    fun streamUrlFor(rel: String): String =
-        "http://127.0.0.1:${server.port}/t/${encodePath(rel)}"
+    fun lanHost(): String? = try {
+        val iter = NetworkInterface.getNetworkInterfaces()
+        while (iter.hasMoreElements()) {
+            val ni = iter.nextElement()
+            if (ni.isUp && !ni.isLoopback) {
+                val addrs = ni.inetAddresses
+                while (addrs.hasMoreElements()) {
+                    val a = addrs.nextElement()
+                    if (!a.isLoopbackAddress && a is Inet4Address) return a.hostAddress
+                }
+            }
+        }
+        null
+    } catch (e: Throwable) {
+        null
+    }
+
+    fun streamUrlFor(rel: String): String {
+        val host = if (useLan.get()) (lanHost() ?: "127.0.0.1") else "127.0.0.1"
+        return "http://$host:${server.port}/t/${encodePath(rel)}"
+    }
 
     fun buildTrack(rel: String): SampleTrack {
         val name = rel.substringAfterLast('/')
@@ -305,7 +343,23 @@ class SampleMurglar(
         )
     }
 
+    fun buildRemoteTestTrack(): SampleTrack = SampleTrack(
+        id = REMOTE_TEST_TRACK_ID,
+        title = "Remote URL test",
+        filePath = "",
+        artistNames = listOf("Test"),
+        sources = listOf(
+            Source(
+                "https://download.samplelib.com/mp3/sample-15s.mp3", null, "Test",
+                Extension.MP3, Container.PROGRESSIVE, Bitrate.B_320, HIGH_QUALITY
+            )
+        ),
+        mediaId = MediaId.build(SERVICE_ID, REMOTE_TEST_TRACK_ID),
+        nodeType = NodeType.TRACK
+    )
+
     fun getTrackById(id: String): SampleTrack? {
+        if (id == REMOTE_TEST_TRACK_ID) return buildRemoteTestTrack()
         val rel = decodeId(id) ?: return null
         return buildTrack(rel)
     }
@@ -352,6 +406,7 @@ class SampleMurglar(
             } else {
                 sb.append(" | probe: ${file.name}")
                 sb.append(" | server port: ${server.port}")
+                sb.append(" | lan host: ${lanHost() ?: "none"}")
 
                 // тест 1: читаем файл напрямую через SAF
                 try {
@@ -423,7 +478,7 @@ private class LocalHttpServer(
 
     fun start() {
         if (serverSocket != null) return
-        val ss = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
+        val ss = ServerSocket(0, 64, InetAddress.getByName("0.0.0.0"))
         serverSocket = ss
         port = ss.localPort
         val acceptor = Thread {
