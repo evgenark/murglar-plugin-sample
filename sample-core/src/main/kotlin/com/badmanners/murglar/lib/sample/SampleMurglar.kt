@@ -214,7 +214,7 @@ class SampleMurglar(
                 .getMethod("currentPackageName").invoke(null) as String
             val dir = File("/storage/emulated/0/Android/data/$pkg/files")
             dir.mkdirs()
-            File(dir, "diagnostics.txt").writeText(sb.toString())
+            val file = File(dir, "diagnostics.txt").writeText(...)
             file.absolutePath
         } catch (e: Exception) {
             "report write failed: ${e.message}"
