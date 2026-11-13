@@ -27,7 +27,16 @@ import com.badmanners.murglar.lib.sample.localization.SampleRussianMessages
 import com.badmanners.murglar.lib.sample.login.SampleLoginResolver
 import com.badmanners.murglar.lib.sample.model.track.SampleTrack
 import com.badmanners.murglar.lib.sample.node.SampleNodeResolver
+import java.io.BufferedInputStream
+import java.io.BufferedOutputStream
+import java.io.ByteArrayOutputStream
 import java.io.File
+import java.io.InputStream
+import java.io.OutputStream
+import java.net.InetAddress
+import java.net.ServerSocket
+import java.net.Socket
+import java.util.concurrent.Executors
 
 
 class SampleMurglar(
@@ -67,7 +76,7 @@ class SampleMurglar(
             ActionPreference(
                 id = "diagnostics",
                 title = "Diagnostics",
-                summary = "Tests SAF access to the Music folder",
+                summary = "Tests SAF access and the local HTTP server",
                 action = { notifications.longNotify(buildDiagnosticsReport()) },
                 needConfirmation = false
             )
@@ -180,7 +189,6 @@ class SampleMurglar(
                 val isDir = mime == "vnd.android.document/directory"
                 val bytes = if (isNull.invoke(cursor, 3) as Boolean) 0L else getLong.invoke(cursor, 3) as Long
 
-                // documentId внутри дерева имеет вид "primary:Music/<путь>"
                 val relPath = documentId.removePrefix("$TREE_PREFIX/")
 
                 if (isDir)
@@ -200,18 +208,72 @@ class SampleMurglar(
         }
     }
 
+    fun openSafStream(rel: String): InputStream? {
+        val resolver = contentResolver() ?: return null
+        val uri = contentUriFor(rel) ?: return null
+        return try {
+            resolver.javaClass.getMethod("openInputStream", uriClass)
+                .invoke(resolver, parseUri(uri)) as InputStream
+        } catch (e: Throwable) {
+            null
+        }
+    }
+
+    fun safFileSize(rel: String): Long {
+        val resolver = contentResolver() ?: return -1L
+        val uri = contentUriFor(rel) ?: return -1L
+        var cursor: Any? = null
+        return try {
+            cursor = resolver.javaClass.getMethod(
+                "query", uriClass, Array<String>::class.java,
+                String::class.java, Array<String>::class.java, String::class.java
+            ).invoke(resolver, parseUri(uri), arrayOf("_size"), null, null, null)
+                ?: return -1L
+            val c = cursor
+            val moveToFirst = c.javaClass.getMethod("moveToFirst")
+            val getLong = c.javaClass.getMethod("getLong", Int::class.javaPrimitiveType)
+            val close = c.javaClass.getMethod("close")
+            if (moveToFirst.invoke(c) as Boolean) {
+                val size = getLong.invoke(c, 0) as Long
+                close.invoke(c)
+                size
+            } else {
+                close.invoke(c)
+                -1L
+            }
+        } catch (e: Throwable) {
+            try { cursor?.javaClass?.getMethod("close")?.invoke(cursor) } catch (ignored: Throwable) {}
+            -1L
+        }
+    }
+
+    //endregion
+
+
+    //region local http server
+
+    private val server: LocalHttpServer by lazy {
+        LocalHttpServer(
+            opener = { rel -> openSafStream(rel) },
+            sizer = { rel -> safFileSize(rel) }
+        ).also { it.start() }
+    }
+
+    fun streamUrlFor(rel: String): String =
+        "http://127.0.0.1:${server.port}/t/${encodePath(rel)}"
+
     fun buildTrack(rel: String): SampleTrack {
         val name = rel.substringAfterLast('/')
         val parent = rel.substringBeforeLast('/', "")
-        val artist = if (parent.isEmpty()) "Music" else parent.substringAfterLast('/')
+        val artist = if (parent.isEmpty()) "Music" else parent.substringAfterLast('/').replace('_', ' ')
         return SampleTrack(
             id = encodePath(rel),
-            title = name.substringBeforeLast('.'),
+            title = name.substringBeforeLast('.').replace('_', ' '),
             filePath = rel,
             artistNames = listOf(artist),
             sources = listOf(
                 Source(
-                    contentUriFor(rel) ?: rel, null, "Local file",
+                    streamUrlFor(rel), null, "Local file",
                     Extension.UNKNOWN, Container.PROGRESSIVE, Bitrate.B_UNKNOWN, HIGH_QUALITY
                 )
             ),
@@ -224,6 +286,9 @@ class SampleMurglar(
         val rel = decodeId(id) ?: return null
         return buildTrack(rel)
     }
+
+    //endregion
+
 
     private fun buildDiagnosticsReport(): String {
         val sb = StringBuilder()
@@ -243,8 +308,24 @@ class SampleMurglar(
                 else
                     sb.append(" | ${root.first[0].name}: dirs=${sub.first.size} files=${sub.second.size}")
             }
-            if (root.second.isNotEmpty())
-                sb.append(" | sample url: ${contentUriFor(root.second[0].relPath)}")
+            if (root.second.isNotEmpty()) {
+                val probe = root.second[0]
+                sb.append(" | server port: ${server.port}")
+                try {
+                    val stream = openSafStream(probe.relPath)
+                    if (stream == null)
+                        sb.append(" | stream: OPEN FAILED")
+                    else {
+                        val head = ByteArray(16)
+                        val read = stream.read(head)
+                        stream.close()
+                        sb.append(" | stream: ok ($read bytes) | ${probe.name}")
+                        sb.append(" | sample url: ${streamUrlFor(probe.relPath)}")
+                    }
+                } catch (e: Exception) {
+                    sb.append(" | stream: error ${e.message}")
+                }
+            }
         }
 
         val reportPath = try {
@@ -261,5 +342,183 @@ class SampleMurglar(
         sb.append(" | FULL REPORT: $reportPath")
         return sb.toString()
     }
-    //endregion
+}
+
+
+private class LocalHttpServer(
+    private val opener: (String) -> InputStream?,
+    private val sizer: (String) -> Long
+) {
+    private var serverSocket: ServerSocket? = null
+    private val pool = Executors.newCachedThreadPool { r ->
+        Thread(r).apply { isDaemon = true; name = "localfiles-http" }
+    }
+    var port: Int = -1
+        private set
+
+    fun start() {
+        if (serverSocket != null) return
+        val ss = ServerSocket(0, 64, InetAddress.getByName("127.0.0.1"))
+        serverSocket = ss
+        port = ss.localPort
+        val acceptor = Thread {
+            while (!ss.isClosed) {
+                val client = try { ss.accept() } catch (e: Throwable) { break }
+                pool.execute { handle(client) }
+            }
+        }
+        acceptor.isDaemon = true
+        acceptor.name = "localfiles-acceptor"
+        acceptor.start()
+    }
+
+    private fun handle(client: Socket) {
+        try {
+            client.use { socket ->
+                socket.soTimeout = 15000
+                val input = BufferedInputStream(socket.getInputStream())
+                val out = BufferedOutputStream(socket.getOutputStream())
+
+                val requestLine = readLine(input) ?: return
+                val parts = requestLine.split(" ")
+                if (parts.size < 2) { respondError(out, 400, "Bad request"); return }
+                val method = parts[0].uppercase()
+                val path = parts[1]
+
+                var rangeHeader: String? = null
+                while (true) {
+                    val line = readLine(input) ?: break
+                    if (line.isEmpty()) break
+                    val idx = line.indexOf(':')
+                    if (idx > 0) {
+                        val name = line.substring(0, idx).trim().lowercase()
+                        if (name == "range")
+                            rangeHeader = line.substring(idx + 1).trim()
+                    }
+                }
+
+                if (!path.startsWith("/t/")) { respondError(out, 404, "Not found"); return }
+                val id = path.removePrefix("/t/").substringBefore('?')
+                val rel = decodeHex(id) ?: run { respondError(out, 400, "Bad id"); return }
+
+                val stream = opener(rel) ?: run { respondError(out, 404, "File unavailable"); return }
+                val total = sizer(rel)
+
+                var start = 0L
+                var endInclusive = -1L
+                var partial = false
+                if (rangeHeader != null && rangeHeader.startsWith("bytes=")) {
+                    val spec = rangeHeader.removePrefix("bytes=").split(',')[0].trim()
+                    val dash = spec.indexOf('-')
+                    if (dash >= 0) {
+                        val s = spec.substring(0, dash).trim()
+                        val e = spec.substring(dash + 1).trim()
+                        start = if (s.isEmpty()) 0L else (s.toLongOrNull() ?: 0L)
+                        endInclusive = if (e.isEmpty()) -1L else (e.toLongOrNull() ?: -1L)
+                        partial = start > 0 || endInclusive >= 0
+                    }
+                }
+
+                val mime = mimeFor(rel)
+                val sb = StringBuilder()
+
+                if (partial && total > 0) {
+                    if (start >= total) {
+                        respondError(out, 416, "Range not satisfiable")
+                        return
+                    }
+                    val end = if (endInclusive < 0) total - 1 else minOf(endInclusive, total - 1)
+                    val length = end - start + 1
+                    sb.append("HTTP/1.1 206 Partial Content\r\n")
+                    sb.append("Content-Type: ").append(mime).append("\r\n")
+                    sb.append("Content-Range: bytes ").append(start).append('-').append(end).append('/').append(total).append("\r\n")
+                    sb.append("Content-Length: ").append(length).append("\r\n")
+                    sb.append("Accept-Ranges: bytes\r\n")
+                    sb.append("Connection: close\r\n\r\n")
+                    out.write(sb.toString().toByteArray(Charsets.ISO_8859_1))
+                    skipFully(stream, start)
+                    copy(stream, out, length)
+                } else {
+                    sb.append("HTTP/1.1 200 OK\r\n")
+                    sb.append("Content-Type: ").append(mime).append("\r\n")
+                    if (total > 0) sb.append("Content-Length: ").append(total).append("\r\n")
+                    sb.append("Accept-Ranges: bytes\r\n")
+                    sb.append("Connection: close\r\n\r\n")
+                    out.write(sb.toString().toByteArray(Charsets.ISO_8859_1))
+                    if (method != "HEAD") copy(stream, out, -1)
+                }
+                out.flush()
+            }
+        } catch (e: Throwable) {
+            // client disconnected — nothing to do
+        }
+    }
+
+    private fun copy(stream: InputStream, out: OutputStream, limit: Long) {
+        val buffer = ByteArray(64 * 1024)
+        var remaining = limit
+        while (remaining != 0L) {
+            val toRead = if (remaining < 0) buffer.size
+            else minOf(remaining, buffer.size.toLong()).toInt()
+            val read = stream.read(buffer, 0, toRead)
+            if (read < 0) break
+            out.write(buffer, 0, read)
+            if (remaining > 0) remaining -= read
+        }
+    }
+
+    private fun skipFully(stream: InputStream, count: Long) {
+        var remaining = count
+        val buffer = ByteArray(64 * 1024)
+        while (remaining > 0) {
+            val skipped = stream.skip(remaining)
+            if (skipped > 0) { remaining -= skipped; continue }
+            val read = stream.read(buffer, 0, minOf(remaining, buffer.size.toLong()).toInt())
+            if (read < 0) break
+            remaining -= read
+        }
+    }
+
+    private fun respondError(out: OutputStream, code: Int, message: String) {
+        val body = "$message\n"
+        val head = "HTTP/1.1 $code $message\r\n" +
+            "Content-Type: text/plain; charset=utf-8\r\n" +
+            "Content-Length: ${body.toByteArray(Charsets.UTF_8).size}\r\n" +
+            "Connection: close\r\n\r\n"
+        out.write(head.toByteArray(Charsets.ISO_8859_1))
+        out.write(body.toByteArray(Charsets.UTF_8))
+        out.flush()
+    }
+
+    private fun readLine(input: InputStream): String? {
+        val sb = StringBuilder()
+        var prev = -1
+        while (true) {
+            val b = input.read()
+            if (b < 0) return if (sb.isEmpty()) null else sb.toString()
+            if (b == '\n'.code)
+                return if (prev == '\r'.code) sb.dropLast(1).toString() else sb.toString()
+            sb.append(b.toChar())
+            prev = b
+            if (sb.length > 16384) return sb.toString()
+        }
+    }
+
+    private fun decodeHex(id: String): String? = try {
+        id.chunked(2).map { it.toInt(16).toByte() }.toByteArray().toString(Charsets.UTF_8)
+    } catch (e: Exception) {
+        null
+    }
+
+    private fun mimeFor(rel: String): String =
+        when (rel.substringAfterLast('.', "").lowercase()) {
+            "mp3" -> "audio/mpeg"
+            "flac" -> "audio/flac"
+            "ogg", "oga", "opus" -> "audio/ogg"
+            "m4a", "aac" -> "audio/mp4"
+            "wav" -> "audio/wav"
+            "wma" -> "audio/x-ms-wma"
+            "ape" -> "audio/ape"
+            else -> "application/octet-stream"
+        }
 }
