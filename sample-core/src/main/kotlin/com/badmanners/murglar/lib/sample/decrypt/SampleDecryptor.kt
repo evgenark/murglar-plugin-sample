@@ -23,7 +23,7 @@ class SampleDecryptor(private val logger: LoggerMiddleware) : Decryptor<SampleTr
         private const val LATIN_CHARSET = "ISO-8859-1"
     }
 
-    override fun isEncrypted(track: SampleTrack, source: Source) = true
+    override fun isEncrypted(track: SampleTrack, source: Source) = false
 
     override val decryptionChunkSize = CHUNK_SIZE
 
