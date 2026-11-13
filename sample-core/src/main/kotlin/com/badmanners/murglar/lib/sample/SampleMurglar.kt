@@ -52,6 +52,7 @@ class SampleMurglar(
 
     companion object {
         const val SERVICE_ID = "localfiles"
+        private const val TAG = "LocalFilesPlugin"
 
         /**
          * SAF tree granted to Murglar ("save path" setting).
@@ -84,23 +85,20 @@ class SampleMurglar(
         )
 
     override val possibleFormats: List<SourceFormat>
-        get() = listOf(
-            SourceFormat(Extension.UNKNOWN, Bitrate.B_UNKNOWN, HIGH_QUALITY, AVAILABLE)
-        )
+        get() = AUDIO_EXTENSIONS
+            .mapNotNull { ext -> runCatching { Extension.valueOf(ext.uppercase()) }.getOrNull() }
+            .map { SourceFormat(it, Bitrate.B_UNKNOWN, HIGH_QUALITY, AVAILABLE) }
+            .ifEmpty {
+                listOf(SourceFormat(Extension.UNKNOWN, Bitrate.B_UNKNOWN, HIGH_QUALITY, AVAILABLE))
+            }
 
     override suspend fun onCreate() {
     }
 
     override suspend fun resolveSourceForUrl(track: SampleTrack, source: Source): Source {
-    logger.d(TAG, "resolveSourceForUrl: ${source.url}")
-    return source
-}
-
-companion object {
-    // ... существующие константы ...
-    private const val TAG = "LocalFilesPlugin"
-}
-
+        logd("resolveSourceForUrl called")
+        return source
+    }
 
     override fun hasLyrics(track: SampleTrack) = false
 
@@ -162,6 +160,21 @@ companion object {
 
     fun isAudioFile(name: String) =
         AUDIO_EXTENSIONS.contains(name.substringAfterLast('.', "").lowercase())
+
+    fun extensionFor(name: String): Extension {
+        val ext = name.substringAfterLast('.', "").uppercase()
+        val candidates = when (ext) {
+            "MP3" -> listOf("MP3")
+            "FLAC" -> listOf("FLAC")
+            "OGG", "OGA" -> listOf("OGG", "VORBIS")
+            "OPUS" -> listOf("OPUS", "OGG")
+            "M4A", "AAC" -> listOf("AAC", "M4A")
+            "WAV" -> listOf("WAV")
+            else -> emptyList()
+        }
+        return candidates.firstNotNullOfOrNull { c -> runCatching { Extension.valueOf(c) }.getOrNull() }
+            ?: Extension.UNKNOWN
+    }
 
     fun listSaf(rel: String): Pair<List<SafEntry>, List<SafEntry>>? {
         val resolver = contentResolver() ?: return null
@@ -284,7 +297,7 @@ companion object {
             sources = listOf(
                 Source(
                     streamUrlFor(rel), null, "Local file",
-                    Extension.UNKNOWN, Container.PROGRESSIVE, Bitrate.B_UNKNOWN, HIGH_QUALITY
+                    extensionFor(name), Container.PROGRESSIVE, Bitrate.B_UNKNOWN, HIGH_QUALITY
                 )
             ),
             mediaId = MediaId.build(SERVICE_ID, encodePath(rel)),
@@ -299,6 +312,16 @@ companion object {
 
     //endregion
 
+
+    private fun logd(message: String) {
+        try {
+            Class.forName("android.util.Log")
+                .getMethod("d", String::class.java, String::class.java)
+                .invoke(null, TAG, message)
+        } catch (e: Throwable) {
+            // no logging available — ignore
+        }
+    }
 
     private fun buildDiagnosticsReport(): String {
         val sb = StringBuilder()
@@ -346,32 +369,27 @@ companion object {
                 }
 
                 // тест 2: обращаемся к собственному серверу из фонового потока
-                try {
-                    var result = "no result"
-                    val t = Thread {
-                        try {
-                            val conn = URL(streamUrlFor(file.relPath)).openConnection() as HttpURLConnection
-                            conn.connectTimeout = 5000
-                            conn.readTimeout = 5000
-                            conn.requestMethod = "GET"
-                            val code = conn.responseCode
-                            val ins = if (code in 200..299) conn.inputStream else conn.errorStream
-                            val first = ins?.read() ?: -1
-                            ins?.close()
-                            conn.disconnect()
-                            result = "$code (first byte: $first)"
-                        } catch (e: Exception) {
-                            result = "error ${e.javaClass.simpleName}: ${e.message}"
-                        }
+                var result = "no result"
+                val t = Thread {
+                    try {
+                        val conn = URL(streamUrlFor(file.relPath)).openConnection() as HttpURLConnection
+                        conn.connectTimeout = 5000
+                        conn.readTimeout = 5000
+                        conn.requestMethod = "GET"
+                        val code = conn.responseCode
+                        val ins = if (code in 200..299) conn.inputStream else conn.errorStream
+                        val first = ins?.read() ?: -1
+                        ins?.close()
+                        conn.disconnect()
+                        result = "$code (first byte: $first)"
+                    } catch (e: Exception) {
+                        result = "error ${e.javaClass.simpleName}: ${e.message}"
                     }
-                    t.isDaemon = true
-                    t.start()
-                    t.join(6000)
-                    sb.append(" | http self-test: ").append(result)
-                } catch (e: Exception) {
-                    sb.append(" | http self-test: outer error ${e.message}")
                 }
-              }
+                t.isDaemon = true
+                t.start()
+                t.join(6000)
+                sb.append(" | http self-test: ").append(result)
             }
         }
 
