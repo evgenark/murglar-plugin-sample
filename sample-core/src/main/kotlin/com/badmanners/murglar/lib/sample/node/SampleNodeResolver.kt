@@ -71,7 +71,7 @@ class SampleNodeResolver(
     private suspend fun listFiles(parentPath: Path, page: Int?, params: Map<String, String>): List<Node> {
         val rel = murglar.decodeId(params["dirId"]!!) ?: return emptyList()
         val (_, files) = murglar.listSaf(rel) ?: return emptyList()
-        return files.map { murglar.buildTrack(it.relPath).convertSampleTrack(parentPath) }
+        return files.map { murglar.buildTrack(it.relPath, it.bytes).convertSampleTrack(parentPath) }
     }
 
     private fun listChildren(rel: String, parentPath: Path): List<Node> {

@@ -323,46 +323,52 @@ class SampleMurglar(
         return "http://$host:${server.port}/t/${encodePath(rel)}"
     }
 
-    fun buildTrack(rel: String): SampleTrack {
-        val name = rel.substringAfterLast('/')
-        val parent = rel.substringBeforeLast('/', "")
-        val artist = if (parent.isEmpty()) "Music" else parent.substringAfterLast('/').replace('_', ' ')
-        return SampleTrack(
-            id = encodePath(rel),
-            title = name.substringBeforeLast('.').replace('_', ' '),
-            filePath = rel,
-            artistNames = listOf(artist),
-            sources = listOf(
-                Source(
-                    streamUrlFor(rel), null, "Local file",
-                    extensionFor(name), Container.PROGRESSIVE, Bitrate.B_UNKNOWN, HIGH_QUALITY
-                )
-            ),
-            mediaId = MediaId.build(SERVICE_ID, encodePath(rel)),
-            nodeType = NodeType.TRACK
-        )
-    }
-
-    fun buildRemoteTestTrack(): SampleTrack = SampleTrack(
-        id = REMOTE_TEST_TRACK_ID,
-        title = "Remote URL test",
-        filePath = "",
-        artistNames = listOf("Test"),
+    
+fun buildTrack(rel: String, bytes: Long = -1L): SampleTrack {
+    val name = rel.substringAfterLast('/')
+    val parent = rel.substringBeforeLast('/', "")
+    val artist = if (parent.isEmpty()) "Music" else parent.substringAfterLast('/').replace('_', ' ')
+    val durationMs = if (bytes > 0) bytes * 8 / 320 else 0L   // 5 МБ → ~125 сек при 320 kbps
+    return SampleTrack(
+        id = encodePath(rel),
+        title = name.substringBeforeLast('.').replace('_', ' '),
+        filePath = rel,
+        artistNames = listOf(artist),
         sources = listOf(
             Source(
-                "https://download.samplelib.com/mp3/sample-15s.mp3", null, "Test",
-                Extension.MP3, Container.PROGRESSIVE, Bitrate.B_320, HIGH_QUALITY
+                null, streamUrlFor(rel), "Local file",
+                extensionFor(name), Container.PROGRESSIVE, Bitrate.B_UNKNOWN, HIGH_QUALITY
             )
         ),
-        mediaId = MediaId.build(SERVICE_ID, REMOTE_TEST_TRACK_ID),
+        mediaId = MediaId.build(SERVICE_ID, encodePath(rel)),
+        durationMs = durationMs,
         nodeType = NodeType.TRACK
     )
+}
 
-    fun getTrackById(id: String): SampleTrack? {
-        if (id == REMOTE_TEST_TRACK_ID) return buildRemoteTestTrack()
-        val rel = decodeId(id) ?: return null
-        return buildTrack(rel)
-    }
+
+fun buildRemoteTestTrack(): SampleTrack = SampleTrack(
+    id = REMOTE_TEST_TRACK_ID,
+    title = "Remote URL test",
+    filePath = "",
+    artistNames = listOf("Test"),
+    sources = listOf(
+        Source(
+            null, "https://download.samplelib.com/mp3/sample-15s.mp3", "Test",
+            Extension.MP3, Container.PROGRESSIVE, Bitrate.B_320, HIGH_QUALITY
+        )
+    ),
+    mediaId = MediaId.build(SERVICE_ID, REMOTE_TEST_TRACK_ID),
+    durationMs = 15_000L,
+    nodeType = NodeType.TRACK
+)
+
+    
+fun getTrackById(id: String): SampleTrack? {
+    if (id == REMOTE_TEST_TRACK_ID) return buildRemoteTestTrack()
+    val rel = decodeId(id) ?: return null
+    return buildTrack(rel, safFileSize(rel))
+}
 
     //endregion
 

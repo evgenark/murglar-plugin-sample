@@ -1,3 +1,4 @@
+
 package com.badmanners.murglar.lib.sample.model.track
 
 import com.badmanners.murglar.lib.core.model.node.NodeType
@@ -14,6 +15,7 @@ class SampleTrack(
     artistNames: List<String>,
     sources: List<Source>,
     mediaId: String,
+    durationMs: Long = 0L,
     override val nodeType: String
 ) : BaseTrack(
     id = id,
@@ -26,7 +28,7 @@ class SampleTrack(
     albumReleaseDate = null,
     indexInAlbum = null,
     volumeNumber = null,
-    durationMs = 0L,
+    durationMs = durationMs,
     genre = null,
     explicit = false,
     gain = null,
